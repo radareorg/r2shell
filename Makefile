@@ -1,2 +1,2 @@
 all:
-	gcc main.c $(shell pkg-config --cflags --libs r_core)
+	gcc -g main.c $(shell pkg-config --cflags --libs r_core)

@@ -21,6 +21,8 @@ typedef struct {
 	int repeat;
 	RList *args;
 	RList *ats;
+	RList *fors;
+	RList *trifors;
 	RShellCommand *sc;
 	char *_argstr;
 	char *atstr;
@@ -126,11 +128,11 @@ beach:
 	return stack;
 }
 
-RList *shell_split_args(RShellInstruction *si, const char *in) {
+static void shell_split_args(RShellInstruction *si, const char *in) {
 	const char *oin = in;
 	bool escape = false;
 	const char *ats = NULL;
-	RList *args = r_list_newf (free);
+	RList *args = si->args;
 	int skip = 0;
 	while (*in) {
 		if (skip) {
@@ -139,19 +141,29 @@ RList *shell_split_args(RShellInstruction *si, const char *in) {
 			continue;
 		}
 		switch (*in) {
-		case '@':
-			if (si->atstr) {
-				// 59x 123@34+@25@
-				r_list_append (si->ats, r_str_ndup (oin, in - oin));
-				oin = in + 1;
+		case '@': {
+			char *a = r_str_ndup (oin, in - oin);
+			r_str_trim (a);
+			if (!R_STR_ISEMPTY (a)) {
+				r_list_append (args, a);
 			} else {
-				char *a = r_str_ndup (oin, in - oin);
-				if (!R_STR_ISEMPTY (a)) {
-					r_list_append (args, a);
-					si->atstr = strdup (in + 1);
+				free (a);
+			}
+			if (in[1] == '@') { // @@
+				if (in[2] == '@') { // @@@
+					args = si->trifors;
+					in += 2;
+					oin = in + 1;
+				} else {
+					args = si->fors;
+					in += 1;
+					oin = in + 1;
 				}
+			} else { // @
+				args = si->ats;
 				oin = in + 1;
 			}
+			  }
 			break;
 		case '`':
 		case '\'':
@@ -159,32 +171,21 @@ RList *shell_split_args(RShellInstruction *si, const char *in) {
 			skip = *in;
 			break;
 		case ' ':
-			if (si->atstr) {
+			if (si->args == args) {
 				char *a = r_str_ndup (oin, in - oin);
+				r_str_trim (a);
 				if (!R_STR_ISEMPTY (a)) {
 					r_list_append (args, a);
 				}
-				r_list_append (si->ats, r_str_ndup (oin, in - oin));
-			} else {
-				char *a = r_str_ndup (oin, in - oin);
-				if (!R_STR_ISEMPTY (a)) {
-					r_list_append (args, a);
-				}
+				oin = in + 1;
 			}
-			oin = in + 1;
 			break;
 		}
 		in++;
 	}
 	if (*oin) {
-		if (si->atstr) {
-			r_list_append (si->ats, r_str_ndup (oin, in - oin));
-		} else {
-			r_list_append (args, r_str_ndup (oin, in - oin));
-		}
+		r_list_append (args, r_str_ndup (oin, in - oin));
 	}
-	si->args = args;
-	return args;
 }
 
 R_API RShellInstruction *r_shell_decode(RShell *s, RShellCommand *sc) {
@@ -201,7 +202,10 @@ R_API RShellInstruction *r_shell_decode(RShell *s, RShellCommand *sc) {
 	free (sc->cmd);
 	sc->cmd = q;
 	const char *ats;
+	si->args = r_list_newf (free);
 	si->ats = r_list_newf (free);
+	si->fors = r_list_newf (free);
+	si->trifors = r_list_newf (free);
 	shell_split_args (si, si->_argstr);
 	return si;
 }
@@ -251,6 +255,18 @@ static void run_command(RCore *core, RShell *s, const char *cmd) {
 			pj_s (s->pj, arg);
 		}
 		pj_end (s->pj);
+		//
+		pj_ka (s->pj, "fors");
+		r_list_foreach (si->fors, iter, arg) {
+			pj_s (s->pj, arg);
+		}
+		pj_end (s->pj);
+		//
+		pj_ka (s->pj, "trifors");
+		r_list_foreach (si->trifors, iter, arg) {
+			pj_s (s->pj, arg);
+		}
+		pj_end (s->pj);
 		pj_ka (s->pj, "run");
 		// one decoded instruction may require many evaluations to reach the final form
 		for (;;) {
@@ -288,16 +304,20 @@ static void run_command(RCore *core, RShell *s, const char *cmd) {
 	//
 }
 
-int main() {
+int main(int argc, char **argv) {
 	RShell *s = r_shell_new ();
 	RCore *core = r_core_new ();
-	run_command (core, s, "3s+32;px 64;w \"he#lo; wo#ld\"");
-	while (1) {
-		const char *line = r_line_readline ();
-		if (*line == 'q') {
-			break;
+	if (argc > 1) {
+		run_command (core, s, argv[1]);
+	} else {
+		// run_command (core, s, "3s+32;px 64;w \"he#lo; wo#ld\"");
+		while (1) {
+			const char *line = r_line_readline ();
+			if (*line == 'q') {
+				break;
+			}
+			run_command (core, s, line);
 		}
-		run_command (core, s, line);
 	}
 	r_core_free (core);
 	r_shell_free (s);
