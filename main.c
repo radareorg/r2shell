@@ -7,10 +7,6 @@
 	} else if (*in == skip && !escape) { skip = 0;\
 	} else { escape = false; }
 
-typedef struct {
-	char *cmd;
-} RShellHandler;
-
 
 typedef struct {
 	char *cmd;
@@ -27,6 +23,7 @@ typedef struct {
 	char *_argstr;
 	char *atstr;
 	char *pipestr;
+	char *dumpstr;
 } RShellInstruction;
 
 typedef struct {
@@ -34,10 +31,19 @@ typedef struct {
 	RList *stack; // pile of pending commands to be fetched
 	char *error;
 	PJ *pj;
+	HtPP *cmds;
 } RShell;
+typedef char *(*RShellCallback)(RShell *s, RShellInstruction *si);
+
+typedef struct {
+	char *cmd;
+	RShellCallback cb;
+} RShellHandler;
 
 R_API RShell *r_shell_new(void) {
-	return R_NEW0 (RShell);
+	RShell *s = R_NEW0 (RShell);
+	s->cmds = ht_pp_new0 ();
+	return s;
 }
 
 R_API void r_shell_free(RShell *s) {
@@ -65,7 +71,8 @@ R_API void r_shell_command_free(RShellCommand *s) {
 	r_free (s->comment);
 }
 
-R_API void r_shell_register(RShell *s, const char *name, RShellHandler *sh) {
+R_API void r_shell_register(RShell *s, RShellHandler *sh) {
+	ht_pp_insert (s->cmds, sh->cmd, sh);
 }
 
 static RList *shell_parse_split(RShell *s, const char *_cmd) {
@@ -116,16 +123,14 @@ beach:
 		free (s->error);
 		s->error = r_str_newf ("Missing invalid command%c", 10);
 	}
-	{
-		RShellCommand *c = r_shell_command_new (ocmd);
-		if (c) {
-			if (comment) {
-				c->comment = strdup (comment);
-			}
-			r_list_append (stack, c);
+	RShellCommand *c = r_shell_command_new (ocmd);
+	if (c) {
+		if (comment) {
+			c->comment = strdup (comment);
 		}
-		free (pcmd);
+		r_list_append (stack, c);
 	}
+	free (pcmd);
 	return stack;
 }
 
@@ -171,6 +176,9 @@ static void shell_split_args(RShellInstruction *si, const char *in) {
 		case '"':
 			skip = *in;
 			break;
+		case '>':
+			si->dumpstr = r_str_trim_dup (in + 1);
+			goto done;
 		case '|':
 			si->pipestr = r_str_trim_dup (in + 1);
 			goto done;
@@ -180,6 +188,8 @@ static void shell_split_args(RShellInstruction *si, const char *in) {
 				r_str_trim (a);
 				if (!R_STR_ISEMPTY (a)) {
 					r_list_append (args, a);
+				} else {
+					free (a);
 				}
 				oin = in + 1;
 			}
@@ -189,7 +199,13 @@ static void shell_split_args(RShellInstruction *si, const char *in) {
 	}
 done:
 	if (*oin) {
-		r_list_append (args, r_str_ndup (oin, in - oin));
+		char *a = r_str_ndup (oin, in - oin);
+		if (!R_STR_ISEMPTY (a)) {
+			r_str_trim (a);
+			r_list_append (args, a);
+		} else {
+			free (a);
+		}
 	}
 }
 
@@ -206,7 +222,6 @@ R_API RShellInstruction *r_shell_decode(RShell *s, RShellCommand *sc) {
 	char *q = strdup (p);
 	free (sc->cmd);
 	sc->cmd = q;
-	const char *ats;
 	si->args = r_list_newf (free);
 	si->ats = r_list_newf (free);
 	si->fors = r_list_newf (free);
@@ -216,6 +231,17 @@ R_API RShellInstruction *r_shell_decode(RShell *s, RShellCommand *sc) {
 }
 
 R_API char *r_shell_execute(RShell *s, RShellInstruction *si) {
+	const char *cmd = r_list_get_n (si->args, 0);
+	if (cmd) {
+		bool found = false;
+		RShellHandler *sh = ht_pp_find (s->cmds, cmd, &found);
+		if (found) {
+			eprintf ("FIND %p%c", sh, 10);
+			if (sh && sh->cb) {
+				return sh->cb (s, si);
+			}
+		}
+	}
 	return r_str_newf (""); // exec('%s', repeat=%d, at='%s')", si->sc->cmd, si->repeat, si->atstr);
 }
 
@@ -245,9 +271,18 @@ static void run_command(RCore *core, RShell *s, const char *cmd) {
 		}
 		pj_o (s->pj);
 		pj_ks (s->pj, "command", sc->cmd);
-		pj_ks (s->pj, "comment", sc->comment);
-		pj_ks (s->pj, "atstr", si->atstr);
-		pj_ks (s->pj, "pipestr", si->pipestr);
+		if (sc->comment) {
+			pj_ks (s->pj, "comment", sc->comment);
+		}
+		if (si->atstr) {
+			pj_ks (s->pj, "atstr", si->atstr);
+		}
+		if (si->pipestr) {
+			pj_ks (s->pj, "pipestr", si->pipestr);
+		}
+		if (si->dumpstr) {
+			pj_ks (s->pj, "dumpstr", si->dumpstr);
+		}
 		pj_kn (s->pj, "repeat", si->repeat);
 		pj_ka (s->pj, "args");
 		RListIter *iter;
@@ -307,19 +342,32 @@ static void run_command(RCore *core, RShell *s, const char *cmd) {
 		free (ij);
 		free (json);
 	}
-	//
+}
+
+RShellHandler *r_shell_handler_new(const char *cmd, RShellCallback cb) {
+	RShellHandler *sh = R_NEW0 (RShellHandler);
+	sh->cmd = strdup (cmd);
+	sh->cb = cb;
+	return sh;
+}
+
+static char *cmd_px(RShell *s, RShellInstruction *si) {
+	return strdup ("hexdump");
 }
 
 int main(int argc, char **argv) {
 	RShell *s = r_shell_new ();
+
+	r_shell_register (s, r_shell_handler_new ("px", &cmd_px));
+
 	RCore *core = r_core_new ();
 	if (argc > 1) {
 		run_command (core, s, argv[1]);
 	} else {
 		// run_command (core, s, "3s+32;px 64;w \"he#lo; wo#ld\"");
-		while (1) {
+		for (;;) {
 			const char *line = r_line_readline ();
-			if (*line == 'q') {
+			if (!line || *line == 'q') {
 				break;
 			}
 			run_command (core, s, line);
