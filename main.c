@@ -26,6 +26,7 @@ typedef struct {
 	RShellCommand *sc;
 	char *_argstr;
 	char *atstr;
+	char *pipestr;
 } RShellInstruction;
 
 typedef struct {
@@ -170,6 +171,9 @@ static void shell_split_args(RShellInstruction *si, const char *in) {
 		case '"':
 			skip = *in;
 			break;
+		case '|':
+			si->pipestr = r_str_trim_dup (in + 1);
+			goto done;
 		case ' ':
 			if (si->args == args) {
 				char *a = r_str_ndup (oin, in - oin);
@@ -183,6 +187,7 @@ static void shell_split_args(RShellInstruction *si, const char *in) {
 		}
 		in++;
 	}
+done:
 	if (*oin) {
 		r_list_append (args, r_str_ndup (oin, in - oin));
 	}
@@ -242,6 +247,7 @@ static void run_command(RCore *core, RShell *s, const char *cmd) {
 		pj_ks (s->pj, "command", sc->cmd);
 		pj_ks (s->pj, "comment", sc->comment);
 		pj_ks (s->pj, "atstr", si->atstr);
+		pj_ks (s->pj, "pipestr", si->pipestr);
 		pj_kn (s->pj, "repeat", si->repeat);
 		pj_ka (s->pj, "args");
 		RListIter *iter;
