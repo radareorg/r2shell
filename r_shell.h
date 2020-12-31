@@ -4,6 +4,12 @@ typedef struct {
 } RShellCommand;
 
 typedef struct {
+	char *output;
+	char *error;
+	int rc;
+} RShellResult;
+
+typedef struct {
 	int repeat;
 	RList *args;
 	RList *ats;
@@ -25,7 +31,7 @@ typedef struct {
 	HtPP *cmds;
 } RShell;
 
-typedef char *(*RShellCallback)(RShell *s, RShellInstruction *si);
+typedef RShellResult *(*RShellCallback)(RShell *s, RShellInstruction *si);
 
 typedef struct {
 	char *cmd;
@@ -40,7 +46,7 @@ R_API void r_shell_command_free(RShellCommand *s);
 R_API void r_shell_register(RShell *s, RShellHandler *sh);
 R_API RShellInstruction *r_shell_decode(RShell *s, RShellCommand *sc);
 R_API RShellHandler *r_shell_find_handler(RShell *s, const char *cmd);
-R_API char *r_shell_execute(RShell *s, RShellInstruction *si);
+R_API RShellResult *r_shell_execute(RShell *s, RShellInstruction *si);
 R_API RShellCommand *r_shell_fetch(RShell *s, const char *cmd);
 R_API bool r_shell_eval(RShell *s, RShellInstruction *si);
 R_API char *r_shell_fdex(RShell *s, const char *cmd);

@@ -254,7 +254,21 @@ R_API RShellHandler *r_shell_find_handler(RShell *s, const char *cmd) {
 	return sh;
 }
 
-R_API char *r_shell_execute(RShell *s, RShellInstruction *si) {
+R_API void r_shell_result_free (RShellResult *sr) {
+	free (sr->output);
+	free (sr->error);
+	free (sr);
+}
+
+R_API RShellResult* r_shell_result_new(char *output, char *error, int rc) {
+	RShellResult *r = R_NEW (RShellResult);
+	r->output = output;
+	r->error = error;
+	r->rc = rc;
+	return r;
+}
+
+R_API RShellResult *r_shell_execute(RShell *s, RShellInstruction *si) {
 	const char *cmd = r_list_get_n (si->args, 0);
 	if (cmd) {
 		RShellHandler *sh = r_shell_find_handler (s, cmd);
@@ -263,9 +277,10 @@ R_API char *r_shell_execute(RShell *s, RShellInstruction *si) {
 			if (sh && sh->cb) {
 				return sh->cb (s, si);
 			}
+			return r_shell_result_new (NULL, strdup ("Missing callback in handler."), 1);
 		}
 	}
-	return r_str_newf ("*"); // exec('%s', repeat=%d, at='%s')", si->sc->cmd, si->repeat, si->atstr);
+	return r_shell_result_new (NULL, strdup ("Invalid command."), 1);
 }
 
 R_API RShellCommand *r_shell_fetch(RShell *s, const char *cmd) {
@@ -375,6 +390,7 @@ static void instruction_suffix(RShellInstruction *si, const char *arg) {
 		}
 	}
 }
+
 R_API bool r_shell_eval(RShell *s, RShellInstruction *si);
 
 R_API char *r_shell_fdex(RShell *s, const char *cmd) {
@@ -383,7 +399,19 @@ R_API char *r_shell_fdex(RShell *s, const char *cmd) {
 		RShellInstruction *i = r_shell_decode (s, c);
 		if (i) {
 			r_shell_eval (s, i);
-			return r_shell_execute (s, i);
+			RShellResult *sr = r_shell_execute (s, i);
+			if (sr) {
+				char *output = NULL;
+				if (sr->output) {
+					output = sr->output;
+					sr->output = NULL;
+				}
+				if (sr->error) {
+					eprintf ("%s\n", sr->error);
+				}
+				r_shell_result_free (sr);
+				return output;
+			}
 		}
 	}
 	return NULL;
@@ -474,12 +502,18 @@ static void run_command(RCore *core, RShell *s, const char *cmd) {
 		r_shell_json_from_instruction (pj, si);
 		RListIter *iter;
 		char *arg;
-		char *output = r_shell_execute (s, si);
-		pj_ka (pj, "run");
-		if (output) {
-			pj_ks (s->pj, "output", output);
+		RShellResult *sr = r_shell_execute (s, si);
+		pj_ka (pj, "result");
+		if (sr->rc) {
+			pj_kd (s->pj, "rc", sr->rc);
 		}
-		free (output);
+		if (sr->error) {
+			pj_ks (s->pj, "error", sr->output);
+		}
+		if (sr->output) {
+			pj_ks (s->pj, "output", sr->output);
+		}
+		r_shell_result_free (sr);
 		pj_end (s->pj);
 		r_shell_instruction_free (si);
 		pj_end (s->pj);
@@ -507,8 +541,8 @@ RShellHandler *r_shell_handler_new(const char *cmd, RShellCallback cb) {
 	return sh;
 }
 
-static char *cmd_px(RShell *s, RShellInstruction *si) {
-	return strdup ("hexdump");
+static RShellResult *cmd_px(RShell *s, RShellInstruction *si) {
+	return r_shell_result_new (strdup ("hexdump"), NULL, 0);
 }
 
 int main(int argc, char **argv) {
