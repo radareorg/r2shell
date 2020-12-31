@@ -2,48 +2,12 @@
 
 #include <r_core.h>
 #include <r_util.h>
+#include "r_shell.h"
 
 #define handle_skip(s, in) \
 	if (*in == '\\') { escape = true;\
 	} else if (*in == skip && !escape) { skip = 0;\
 	} else { escape = false; }
-
-
-R_API char *r_shell_fdex(RShell *s, const char *cmd);
-
-
-typedef struct {
-	char *cmd;
-	char *comment;
-} RShellCommand;
-
-typedef struct {
-	int repeat;
-	RList *args;
-	RList *ats;
-	RList *fors;
-	RList *trifors;
-	RShellCommand *sc;
-	char suffix;
-	char *_argstr;
-	char *atstr;
-	char *pipestr;
-	char *dumpstr;
-} RShellInstruction;
-
-typedef struct {
-	// hold configuration and available commands
-	RList *stack; // pile of pending commands to be fetched
-	char *error;
-	PJ *pj;
-	HtPP *cmds;
-} RShell;
-typedef char *(*RShellCallback)(RShell *s, RShellInstruction *si);
-
-typedef struct {
-	char *cmd;
-	RShellCallback cb;
-} RShellHandler;
 
 R_API RShell *r_shell_new(void) {
 	RShell *s = R_NEW0 (RShell);
@@ -515,13 +479,7 @@ static void run_command(RCore *core, RShell *s, const char *cmd) {
 		if (output) {
 			pj_ks (s->pj, "output", output);
 		}
-		//	if (!output) {
-		//		continue;
-		//	}
-		// eprintf ("%s%c", output, 10);
 		free (output);
-		//	break;
-		//}
 		pj_end (s->pj);
 		r_shell_instruction_free (si);
 		pj_end (s->pj);
