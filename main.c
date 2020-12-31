@@ -1,11 +1,15 @@
+/* radare2 - LGPL - Copyright 2020 - pancake */
+
 #include <r_core.h>
 #include <r_util.h>
-
 
 #define handle_skip(s, in) \
 	if (*in == '\\') { escape = true;\
 	} else if (*in == skip && !escape) { skip = 0;\
 	} else { escape = false; }
+
+
+R_API char *r_shell_fdex(RShell *s, const char *cmd);
 
 
 typedef struct {
@@ -20,6 +24,7 @@ typedef struct {
 	RList *fors;
 	RList *trifors;
 	RShellCommand *sc;
+	char suffix;
 	char *_argstr;
 	char *atstr;
 	char *pipestr;
@@ -52,9 +57,13 @@ R_API void r_shell_free(RShell *s) {
 	free (s);
 }
 
-R_API void r_shell_instruction_free(RShellInstruction *s) {
-	free (s->_argstr);
-	free (s);
+R_API void r_shell_instruction_free(RShellInstruction *si) {
+	r_list_free (si->args);
+	r_list_free (si->ats);
+	r_list_free (si->fors);
+	r_list_free (si->trifors);
+	free (si->_argstr);
+	free (si);
 }
 
 R_API RShellCommand *r_shell_command_new(const char *ocmd) {
@@ -76,21 +85,37 @@ R_API void r_shell_register(RShell *s, RShellHandler *sh) {
 }
 
 static RList *shell_parse_split(RShell *s, const char *_cmd) {
+	size_t nest = 0;
 	const char *comment = NULL;
 	char *pcmd = strdup (_cmd);
 	char *cmd = pcmd;
 	RList *stack = r_list_newf ((RListFree)r_shell_command_free);
 	char *ocmd = cmd;
 	int skip = 0;
-	int escape = 0;
+	bool escape = false;
 	while (*cmd) {
 		if (skip) {
+			if (nest) {
+				if (!strncmp (cmd, "$(", 2)) {
+					nest++;
+					cmd++;
+				} else if (*cmd == ')') {
+					skip = 0;
+				}
+			}
 			handle_skip (s, cmd);
 			cmd++;
 			continue;
 		}
 		escape = false;
 		switch (*cmd) {
+		case '$':
+			if (cmd[1] == '(') {
+				nest++;
+				skip = true;
+				// walk until ')' and increase nesting if '$(' is found again
+			}
+			break;
 		case '\\':
 			escape = true;
 			break;
@@ -140,9 +165,21 @@ static void shell_split_args(RShellInstruction *si, const char *in) {
 	const char *ats = NULL;
 	RList *args = si->args;
 	int skip = 0;
+	int nest = 0;
 	while (*in) {
 		if (skip) {
-			handle_skip (s, in);
+			if (nest) {
+				if (!strncmp (in, "$(", 2)) {
+					nest++;
+				} else if (*in == ')') {
+					nest--;
+					if (nest < 1) {
+						skip = false;
+					}
+				}
+			} else {
+				handle_skip (s, in);
+			}
 			in++;
 			continue;
 		}
@@ -170,6 +207,12 @@ static void shell_split_args(RShellInstruction *si, const char *in) {
 				oin = in + 1;
 			}
 			  }
+			break;
+		case '$':
+			if (in[1] == '(') {
+				nest++;
+				skip = ')';
+			}
 			break;
 		case '`':
 		case '\'':
@@ -218,6 +261,9 @@ R_API RShellInstruction *r_shell_decode(RShell *s, RShellCommand *sc) {
 		p++;
 	}
 	si->repeat = atoi (sc->cmd);
+	if (si->repeat < 0) {
+		si->repeat = 0;
+	}
 	si->_argstr = strdup (p);
 	char *q = strdup (p);
 	free (sc->cmd);
@@ -230,19 +276,32 @@ R_API RShellInstruction *r_shell_decode(RShell *s, RShellCommand *sc) {
 	return si;
 }
 
+R_API RShellHandler *r_shell_find_handler(RShell *s, const char *cmd) {
+	RShellHandler *sh = NULL;
+	char *c = strdup (cmd);
+	while (*c) {
+		sh = ht_pp_find (s->cmds, c, NULL);
+		if (sh) {
+			break;
+		}
+		c[strlen (c) - 1] = 0;
+	}
+	free (c);
+	return sh;
+}
+
 R_API char *r_shell_execute(RShell *s, RShellInstruction *si) {
 	const char *cmd = r_list_get_n (si->args, 0);
 	if (cmd) {
-		bool found = false;
-		RShellHandler *sh = ht_pp_find (s->cmds, cmd, &found);
-		if (found) {
-			eprintf ("FIND %p%c", sh, 10);
+		RShellHandler *sh = r_shell_find_handler (s, cmd);
+		if (sh) {
+			eprintf ("FIND %p (%s)%c", sh, sh->cmd, 10);
 			if (sh && sh->cb) {
 				return sh->cb (s, si);
 			}
 		}
 	}
-	return r_str_newf (""); // exec('%s', repeat=%d, at='%s')", si->sc->cmd, si->repeat, si->atstr);
+	return r_str_newf ("*"); // exec('%s', repeat=%d, at='%s')", si->sc->cmd, si->repeat, si->atstr);
 }
 
 R_API RShellCommand *r_shell_fetch(RShell *s, const char *cmd) {
@@ -258,76 +317,215 @@ R_API RShellCommand *r_shell_fetch(RShell *s, const char *cmd) {
 	return r_list_pop_head (s->stack);
 }
 
+static bool r_shell_is_suffix(char ch) {
+	switch (ch) {
+	case 'j': // json
+	case 'q': // quiet
+	case '*': // r2
+	case ',': // table
+		return ch;
+	}
+	return 0;
+}
+
+static const char *find_expr(const char *a, const char **eof) {
+	int nest = 0;
+	const char *o = a;
+	const char *p = a;
+	while (*a) {
+		if (!strncmp (a, "$(", 2)) {
+			p = a + 2;
+			nest++;
+		} else if (*a == ')') {
+			*eof = a;
+			return p;
+		}
+		a++;
+	}
+	if (nest > 0) {
+		eprintf ("Invalid nest.%c", 10);
+	}
+	return NULL;
+}
+
+static void shell_eval(RShell *s, RListIter *iter, const char *arg) {
+	const char *a, *b;
+	if (*arg == '"') {
+		char *r = r_str_ndup (arg + 1, strlen (arg + 1) - 1);
+		r_str_unescape (r);
+		free (iter->data);
+		iter->data = (void *)r;
+		return;
+	}
+loop:
+	for (a = arg; *a ; a++) {
+		if (!strncmp (a, "$(", 2)) {
+			const char *eof, *begin = find_expr (a, &eof);
+			char *piece_a = r_str_ndup (arg, begin - arg - 2);
+			char *piece_b = r_str_ndup (begin, eof - begin);
+			char *piece_c = strdup (eof + 1);
+			if (eof) {
+				char *out = r_shell_fdex (s, piece_b);
+				char *res = r_str_newf ("%s%s%s", piece_a, out, piece_c);
+				free (iter->data);
+				arg = res;
+				iter->data = (void *)arg;
+				free (out);
+			}
+			free (piece_a);
+			free (piece_b);
+			free (piece_c);
+			goto loop;
+		}
+		if (*a == '`') {
+			for (b = ++a; *b; b++) {
+				if (*b == '`') {
+					char *piece_a = r_str_ndup (arg, a - arg - 1);
+					char *piece_b = r_str_ndup (a, b - a);
+					char *piece_c = strdup (b + 1);
+					char *out = r_shell_fdex (s, piece_b);
+					char *res = r_str_newf ("%s%s%s", piece_a, out, piece_c);
+					free (iter->data);
+					arg = res;
+					iter->data = (void *)arg;
+					free (out);
+					free (piece_a);
+					free (piece_b);
+					free (piece_c);
+					goto loop;
+				}
+			}
+		}
+	}
+	if (*a == '`') {
+		eprintf ("Missing closing.%c", 10);
+	}
+}
+
+static void instruction_suffix(RShellInstruction *si, const char *arg) {
+	size_t arg_len = strlen (arg);
+	if (arg_len > 1) {
+		char ch = arg[arg_len - 1];
+		if (r_shell_is_suffix (ch)) {
+			si->suffix = ch;
+		}
+	}
+}
+R_API bool r_shell_eval(RShell *s, RShellInstruction *si);
+
+R_API char *r_shell_fdex(RShell *s, const char *cmd) {
+	RShellCommand *c = r_shell_fetch (s, cmd);
+	if (c) {
+		RShellInstruction *i = r_shell_decode (s, c);
+		if (i) {
+			r_shell_eval (s, i);
+			return r_shell_execute (s, i);
+		}
+	}
+	return NULL;
+}
+
+
+R_API bool r_shell_eval(RShell *s, RShellInstruction *si) {
+	RListIter *iter;
+	const char *arg;
+	// evaluate all 
+	r_list_foreach (si->args, iter, arg) {
+		shell_eval (s, iter, arg);
+	}
+	char *arg0 = r_list_get_n (si->args, 0);
+	if (!R_STR_ISEMPTY (arg0)) {
+		instruction_suffix (si, arg0);
+	}
+	r_list_foreach (si->ats, iter, arg) {
+		shell_eval (s, iter, arg);
+	}
+	r_list_foreach (si->fors, iter, arg) {
+		shell_eval (s, iter, arg);
+	}
+	r_list_foreach (si->trifors, iter, arg) {
+		shell_eval (s, iter, arg);
+	}
+	return true;
+}
+
+R_API void r_shell_json_from_instruction(PJ *pj, RShellInstruction *si) {
+	RListIter *iter;
+	char *arg;
+	if (si->atstr) {
+		pj_ks (pj, "atstr", si->atstr);
+	}
+	if (si->pipestr) {
+		pj_ks (pj, "pipestr", si->pipestr);
+	}
+	if (si->dumpstr) {
+		pj_ks (pj, "dumpstr", si->dumpstr);
+	}
+	pj_kn (pj, "repeat", si->repeat);
+	pj_ka (pj, "args");
+	r_list_foreach (si->args, iter, arg) {
+		pj_s (pj, arg);
+	}
+	pj_end (pj);
+	if (!r_list_empty (si->ats)) {
+		pj_ka (pj, "ats");
+		r_list_foreach (si->ats, iter, arg) {
+			pj_s (pj, arg);
+		}
+		pj_end (pj);
+	}
+	if (!r_list_empty (si->fors)) {
+		pj_ka (pj, "fors");
+		r_list_foreach (si->fors, iter, arg) {
+			pj_s (pj, arg);
+		}
+		pj_end (pj);
+	}
+	if (!r_list_empty (si->trifors)) {
+		pj_ka (pj, "trifors");
+		r_list_foreach (si->trifors, iter, arg) {
+			pj_s (pj, arg);
+		}
+		pj_end (pj);
+	}
+}
+
 static void run_command(RCore *core, RShell *s, const char *cmd) {
 	// TODO: configure shell with proper syntax for command parsing
-	s->pj = pj_new ();
-	pj_a (s->pj);
 	RShellCommand *sc = r_shell_fetch (s, cmd);
 
+	PJ *pj = s->pj = pj_new ();;
+	pj_a (pj);
 	while (sc) {
 		RShellInstruction *si = r_shell_decode (s, sc);
 		if (!si) {
 			break;
 		}
-		pj_o (s->pj);
-		pj_ks (s->pj, "command", sc->cmd);
+		pj_o (pj);
+		pj_ks (pj, "command", sc->cmd);
 		if (sc->comment) {
-			pj_ks (s->pj, "comment", sc->comment);
+			pj_ks (pj, "comment", sc->comment);
 		}
-		if (si->atstr) {
-			pj_ks (s->pj, "atstr", si->atstr);
-		}
-		if (si->pipestr) {
-			pj_ks (s->pj, "pipestr", si->pipestr);
-		}
-		if (si->dumpstr) {
-			pj_ks (s->pj, "dumpstr", si->dumpstr);
-		}
-		pj_kn (s->pj, "repeat", si->repeat);
-		pj_ka (s->pj, "args");
+		r_shell_eval (s, si);
+		r_shell_json_from_instruction (pj, si);
 		RListIter *iter;
 		char *arg;
-		r_list_foreach (si->args, iter, arg) {
-			pj_s (s->pj, arg);
+		char *output = r_shell_execute (s, si);
+		pj_ka (pj, "run");
+		if (output) {
+			pj_ks (s->pj, "output", output);
 		}
-		pj_end (s->pj);
-		pj_ka (s->pj, "ats");
-		r_list_foreach (si->ats, iter, arg) {
-			pj_s (s->pj, arg);
-		}
-		pj_end (s->pj);
-		//
-		pj_ka (s->pj, "fors");
-		r_list_foreach (si->fors, iter, arg) {
-			pj_s (s->pj, arg);
-		}
-		pj_end (s->pj);
-		//
-		pj_ka (s->pj, "trifors");
-		r_list_foreach (si->trifors, iter, arg) {
-			pj_s (s->pj, arg);
-		}
-		pj_end (s->pj);
-		pj_ka (s->pj, "run");
-		// one decoded instruction may require many evaluations to reach the final form
-		for (;;) {
-			pj_o (s->pj);
-			char *output = r_shell_execute (s, si);
-			if (output) {
-				pj_ks (s->pj, "output", output);
-			}
-			pj_end (s->pj);
-			if (!output) {
-				continue;
-			}
-			// eprintf ("%s%c", output, 10);
-			free (output);
-			break;
-		}
+		//	if (!output) {
+		//		continue;
+		//	}
+		// eprintf ("%s%c", output, 10);
+		free (output);
+		//	break;
+		//}
 		pj_end (s->pj);
 		r_shell_instruction_free (si);
-		// fetch the next command (separated by newlines or semicolons)
 		pj_end (s->pj);
+		// fetch the next command (separated by newlines or semicolons)
 		sc = r_shell_fetch (s, NULL);
 	}
 	pj_end (s->pj);
@@ -335,7 +533,7 @@ static void run_command(RCore *core, RShell *s, const char *cmd) {
 		eprintf ("Error: %s%c", s->error, 10);
 		R_FREE (s->error);
 	}
-	if (s->pj) {
+	{
 		char *json = pj_drain (s->pj);
 		char *ij = r_print_json_indent (json, true, "  ", NULL);
 		printf ("%s%c", ij, 10);
