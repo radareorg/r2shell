@@ -260,11 +260,12 @@ R_API void r_shell_result_free (RShellResult *sr) {
 	free (sr);
 }
 
-R_API RShellResult* r_shell_result_new(char *output, char *error, int rc) {
+R_API RShellResult* r_shell_result_new(char *output, char *error, int rc, RShellUndo *undo) {
 	RShellResult *r = R_NEW (RShellResult);
 	r->output = output;
 	r->error = error;
 	r->rc = rc;
+	r->undo = undo;
 	return r;
 }
 
@@ -275,12 +276,25 @@ R_API RShellResult *r_shell_execute(RShell *s, RShellInstruction *si) {
 		if (sh) {
 			eprintf ("FIND %p (%s)%c", sh, sh->cmd, 10);
 			if (sh && sh->cb) {
+				RShellResult *res = sh->cb (s, si);
+				if (res && res->undo) {
+					r_list_push (sh->undo, res->undo);
+					while (sh->undo->length > sh->max_undo) {
+						RShellUndo *u = r_list_pop_head (sh->undo);
+						if (u->free) {
+							u->free (u->user);
+						} else {
+							free (u->user);
+						}
+						free (u);
+					}
+				}
 				return sh->cb (s, si);
 			}
-			return r_shell_result_new (NULL, strdup ("Missing callback in handler."), 1);
+			return r_shell_result_new (NULL, strdup ("Missing callback in handler."), 1, NULL);
 		}
 	}
-	return r_shell_result_new (NULL, strdup ("Invalid command."), 1);
+	return r_shell_result_new (NULL, strdup ("Invalid command."), 1, NULL);
 }
 
 R_API RShellCommand *r_shell_fetch(RShell *s, const char *cmd) {
@@ -534,15 +548,30 @@ static void run_command(RCore *core, RShell *s, const char *cmd) {
 	}
 }
 
-RShellHandler *r_shell_handler_new(const char *cmd, RShellCallback cb) {
+R_API RShellHandler *r_shell_handler_new(const char *cmd, RShellCallback cb) {
 	RShellHandler *sh = R_NEW0 (RShellHandler);
 	sh->cmd = strdup (cmd);
 	sh->cb = cb;
 	return sh;
 }
 
+R_API bool r_shell_undo(RShell *sh) {
+	if (!sh || !sh->undo || !sh->undo->length) {
+		return true;
+	}
+	RShellUndo *u = r_list_pop (sh->undo);
+	const bool ret = u->cb (u->user);
+	if (u->free) {
+		u->free (u->user);
+	} else {
+		free (u->user);
+	}
+	free (u);
+	return ret;
+}
+
 static RShellResult *cmd_px(RShell *s, RShellInstruction *si) {
-	return r_shell_result_new (strdup ("hexdump"), NULL, 0);
+	return r_shell_result_new (strdup ("hexdump"), NULL, 0, NULL);
 }
 
 int main(int argc, char **argv) {
